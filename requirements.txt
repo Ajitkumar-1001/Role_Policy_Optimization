@@ -1,0 +1,12 @@
+art-trainer
+python-dotenv
+numpy
+torch
+torchvision
+torchaudio
+transformers
+datasets
+accelerate
+wandb
+
+
