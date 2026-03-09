@@ -1,51 +1,27 @@
 """
 synthetic_gen.py
-Generates contested synthetic queries from QASPER papers using GPT-4o.
-These are the HIGH VARIANCE queries that make DAPO learn best —
+Generates contested synthetic queries from SQuAD passages using GPT-4o.
+These are HIGH VARIANCE queries that make DAPO learn best —
 questions where role assignment genuinely changes the verdict.
 """
 
 import json
 import asyncio
+import os
+import httpx
 from pathlib import Path
-import litellm # pyright: ignore[reportMissingModuleSource, reportMissingImports]
 from datasets import load_dataset  # pyright: ignore[reportMissingImports]
-from tqdm.asyncio import tqdm  # pyright: ignore[reportMissingModuleSource]
+from tqdm import tqdm  # pyright: ignore[reportMissingModuleSource]
+from src.prompts import GENERATION_PROMPT
+OPENROUTER_URL = os.getenv("OPENROUTER_URL")
+ROUTER_KEY     = os.getenv("ROUTER_KEY")
 
-
-GENERATION_PROMPT = """You are generating training data for a multi-agent adversarial reasoning system.
-
-Given this academic paper excerpt:
----
-{excerpt}
----
-
-Generate 3 contested questions about this excerpt. A contested question is one where:
-- Reasonable people could disagree on the answer
-- Both a "yes" and "no" side have defensible arguments from the text
-- The answer is NOT immediately obvious from a single sentence
-
-For each question provide:
-- A strong argument FOR a positive/affirmative answer (citing specific evidence)
-- A strong argument AGAINST (citing specific contradictions or gaps)
-- The most defensible ground truth answer
-
-Return ONLY valid JSON array, no markdown:
-[
-  {{
-    "query": "<the contested question>",
-    "pro_argument": "<strongest case for yes>",
-    "con_argument": "<strongest case for no>",
-    "ground_truth": "<most defensible answer with brief reasoning>",
-    "evidence": "<the most relevant 2-3 sentences from the excerpt>"
-  }},
-  ...3 items total
-]"""
+GENERATION_PROMPT = GENERATION_PROMPT
 
 
 class SyntheticGenerator:
     """
-    Generates contested queries from QASPER papers.
+    Generates contested queries from SQuAD passages via GPT-4o.
     Output: data/synthetic/queries.jsonl
     Each line = one TrainingQuery-compatible JSON object.
     """
@@ -55,39 +31,45 @@ class SyntheticGenerator:
         self.concurrency = concurrency
         self.semaphore   = asyncio.Semaphore(concurrency)
 
-    async def generate_from_paper(
+    async def _call(self, prompt: str) -> str:
+        """Single OpenRouter call via httpx."""
+        headers = {
+            "Authorization": f"Bearer {ROUTER_KEY}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "https://github.com/nexomnis",
+        }
+        payload = {
+            "model":       self.model,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": 0.8,
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"] or "[]"
+
+    async def generate_from_passage(
         self,
-        paper_id: str,
-        abstract: str,
+        passage_id: str,
+        passage:    str,
     ) -> list[dict]:
-        """Generate 3 contested queries from one paper abstract."""
+        """Generate 3 contested queries from one passage."""
         async with self.semaphore:
             try:
-                response = await litellm.acompletion(
-                    model       = self.model,
-                    messages    = [{
-                        "role": "user",
-                        "content": GENERATION_PROMPT.format(
-                            excerpt = abstract[:1200]
-                        )
-                    }],
-                    temperature = 0.8,   # some diversity in generation
-                    timeout     = 60,
+                raw = await self._call(
+                    GENERATION_PROMPT.format(excerpt=passage[:1200])
                 )
-                raw = response.choices[0].message.content or "[]"
 
                 # Strip markdown fences if present
                 raw = raw.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
+                if "```" in raw:
+                    raw = raw.split("```")[1].lstrip("json")
 
                 items = json.loads(raw)
                 results = []
                 for i, item in enumerate(items[:3]):
                     results.append({
-                        "query_id":     f"synthetic_{paper_id}_{i}",
+                        "query_id":     f"synthetic_{passage_id}_{i}",
                         "query":        item["query"],
                         "evidence":     item["evidence"],
                         "ground_truth": item["ground_truth"],
@@ -99,35 +81,37 @@ class SyntheticGenerator:
                 return results
 
             except Exception as e:
-                print(f"[SyntheticGen] Failed for paper {paper_id}: {e}")
+                print(f"[SyntheticGen] Failed for passage {passage_id}: {e}")
                 return []
 
     async def generate(
         self,
-        n_papers:   int = 100,
+        n_papers:    int = 100,
         output_path: str = "data/synthetic/queries.jsonl",
     ) -> int:
         """
-        Generate synthetic queries from n_papers QASPER abstracts.
-        Target: ~300 queries from 100 papers (3 per paper).
+        Generate synthetic queries from n_papers SQuAD passages.
+        Target: ~300 queries from 100 passages (3 per passage).
         """
-        print(f"[SyntheticGen] Loading QASPER for {n_papers} papers...")
-        dataset = load_dataset("allenai/qasper", split="train", trust_remote_code=True)
+        print(f"[SyntheticGen] Loading SQuAD for {n_papers} passages...")
+        dataset  = load_dataset("rajpurkar/squad", split="train")
 
-        papers = []
+        # Collect unique contexts (passages) — SQuAD has many questions per context
+        seen     = set()
+        passages = []
         for i, example in enumerate(dataset):
-            if len(papers) >= n_papers:
+            ctx = example["context"]
+            if ctx not in seen and len(ctx) > 200:
+                seen.add(ctx)
+                passages.append((str(i), ctx))
+            if len(passages) >= n_papers:
                 break
-            abstract = example.get("abstract", "")
-            if abstract and len(abstract) > 200:
-                papers.append((str(i), abstract))
 
-        print(f"[SyntheticGen] Generating from {len(papers)} papers...")
+        print(f"[SyntheticGen] Generating from {len(passages)} passages...")
 
-        # Run all generations concurrently (rate-limited by semaphore)
-        tasks = [
-            self.generate_from_paper(pid, abstract)
-            for pid, abstract in papers
+        tasks   = [
+            self.generate_from_passage(pid, passage)
+            for pid, passage in passages
         ]
         results = await asyncio.gather(*tasks)
 
@@ -140,5 +124,5 @@ class SyntheticGenerator:
                     f.write(json.dumps(item) + "\n")
                     total += 1
 
-        print(f"[SyntheticGen] Wrote {total} synthetic queries to {output_path}")
+        print(f"[SyntheticGen] Wrote {total} synthetic queries → {output_path}")
         return total
