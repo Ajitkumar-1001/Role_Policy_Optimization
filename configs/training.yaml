@@ -1,0 +1,22 @@
+dapo:
+  group_size:          8
+  epsilon_high:        0.2
+  epsilon_low:         0.1
+  advantage_threshold: 0.01
+  learning_rate:       1e-5
+  max_iterations:      500
+  checkpoint_every:    50
+  base_model:          "Qwen/Qwen2.5-3B-Instruct"
+  project_name:        "nexomnis-dapo"
+  model_name:          "role-assignment-policy"
+
+training_data:
+  sources:
+    squad:       400    # replaces qasper
+    snli:        200    # replaces fever
+    contractnli: 100
+    synthetic:   300    # data/synthetic/queries.jsonl
+
+simulation:
+  max_courtroom_turns: 3
+  timeout_seconds:     120
