@@ -1,4 +1,3 @@
-art-trainer
 python-dotenv
 numpy
 torch
